@@ -26,11 +26,24 @@ fn execution_options() -> &'static ExecutionOptions {
     EXECUTION_OPTIONS.get_or_init(ExecutionOptions::default)
 }
 
-fn ai_binary_name() -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendKind {
+    Codex,
+    Omx,
+}
+
+fn backend_kind() -> BackendKind {
     if execution_options().use_omx {
-        "omx"
+        BackendKind::Omx
     } else {
-        "codex"
+        BackendKind::Codex
+    }
+}
+
+fn ai_binary_name() -> &'static str {
+    match backend_kind() {
+        BackendKind::Codex => "codex",
+        BackendKind::Omx => "omx",
     }
 }
 
@@ -86,20 +99,16 @@ fn debug_log(msg: &str) {
         return;
     };
 
-    let log_paths = [
-        home.join(".opencodex").join("debug").join("codex.log"),
-        home.join(".openclaude").join("debug").join("codex.log"),
-    ];
-
-    for log_path in log_paths {
-        if let Some(parent) = log_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
-            let timestamp = chrono::Local::now().format("%H:%M:%S%.3f");
-            let _ = writeln!(file, "[{}] {}", timestamp, msg);
-            break;
-        }
+    let log_path = home
+        .join(crate::app::dir_name())
+        .join("debug")
+        .join(format!("{}.log", ai_binary_name()));
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&log_path) {
+        let timestamp = chrono::Local::now().format("%H:%M:%S%.3f");
+        let _ = writeln!(file, "[{}] {}", timestamp, msg);
     }
 }
 
@@ -111,7 +120,7 @@ pub struct CodexResponse {
     pub error: Option<String>,
 }
 
-/// Streaming message types for real-time Codex responses
+/// Streaming message types for real-time Codex/OMX responses
 #[derive(Debug, Clone)]
 pub enum StreamMessage {
     /// Initialization - contains thread/session ID
@@ -187,7 +196,7 @@ pub const DEFAULT_ALLOWED_TOOLS: &[&str] = &[
 ];
 
 fn default_system_prompt() -> &'static str {
-    r#"You are a terminal coding assistant running through Codex CLI.
+    r#"You are a terminal coding assistant running through Codex/OMX CLI.
 Be concise. Focus on practical, safe, non-interactive execution.
 Respond in the same language as the user.
 
@@ -268,7 +277,241 @@ fn codex_args(session_id: Option<&str>, working_dir: &str) -> Result<Vec<String>
     Ok(args)
 }
 
-/// Execute a command using Codex CLI (non-streaming convenience wrapper)
+fn omx_args(session_id: Option<&str>, working_dir: &str) -> Result<Vec<String>, String> {
+    // Keep OMX invocation direct (`omx ...`) but pass Codex-compatible exec flags.
+    // OMX forwards these to Codex while preserving OMX behaviors (team/HUD modes).
+    let mut args = vec!["--cd".to_string(), working_dir.to_string()];
+
+    if execution_options().madmax {
+        // OMX-native madmax alias.
+        args.push("--madmax".to_string());
+    } else {
+        args.push("--sandbox".to_string());
+        args.push("danger-full-access".to_string());
+        args.push("-a".to_string());
+        args.push("never".to_string());
+    }
+
+    args.push("exec".to_string());
+
+    if let Some(sid) = session_id {
+        if !is_valid_session_id(sid) {
+            return Err("Invalid session ID format".to_string());
+        }
+        args.push("resume".to_string());
+        args.push(sid.to_string());
+        args.push("--json".to_string());
+        args.push("-".to_string());
+    } else {
+        args.push("--json".to_string());
+        args.push("--skip-git-repo-check".to_string());
+        args.push("-".to_string());
+    }
+
+    Ok(args)
+}
+
+fn backend_args(
+    backend: BackendKind,
+    session_id: Option<&str>,
+    working_dir: &str,
+) -> Result<Vec<String>, String> {
+    match backend {
+        BackendKind::Codex => codex_args(session_id, working_dir),
+        BackendKind::Omx => omx_args(session_id, working_dir),
+    }
+}
+
+#[derive(Debug)]
+struct StreamingAttemptOutcome {
+    done_sent: bool,
+    last_session_id: Option<String>,
+    status_success: bool,
+    status_code: Option<i32>,
+    stderr_output: String,
+    emitted_message_count: usize,
+}
+
+#[derive(Debug)]
+enum StreamingAttemptState {
+    Completed(StreamingAttemptOutcome),
+    Cancelled,
+}
+
+fn is_retryable_resume_error(stderr_output: &str) -> bool {
+    let lower = stderr_output.to_lowercase();
+    let known_patterns = [
+        "failed to resume",
+        "could not resume",
+        "cannot resume",
+        "can't resume",
+        "unable to resume",
+        "invalid value for '--resume'",
+        "invalid value for \"--resume\"",
+        "thread not found",
+        "session not found",
+        "conversation not found",
+        "unknown thread",
+        "unknown session",
+        "no such thread",
+        "no such session",
+        "expired thread",
+        "expired session",
+    ];
+
+    if known_patterns.iter().any(|pattern| lower.contains(pattern)) {
+        return true;
+    }
+
+    let has_resume_context = lower.contains("--resume") || lower.contains("resume ");
+    let has_missing_or_invalid_hint = lower.contains("not found")
+        || lower.contains("does not exist")
+        || lower.contains("unknown")
+        || lower.contains("no such")
+        || lower.contains("expired")
+        || lower.contains("invalid");
+
+    has_resume_context && has_missing_or_invalid_hint
+}
+
+fn execute_command_streaming_once(
+    ai_bin: &str,
+    binary_name: &str,
+    args: &[String],
+    full_prompt: &str,
+    working_dir: &str,
+    sender: &Sender<StreamMessage>,
+    cancel_token: Option<std::sync::Arc<CancelToken>>,
+) -> Result<StreamingAttemptState, String> {
+    let mut child = Command::new(ai_bin)
+        .args(args)
+        .current_dir(working_dir)
+        .env_remove("CLAUDECODE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start {}: {}", binary_name, e))?;
+
+    if let Some(ref token) = cancel_token {
+        *token.child_pid.lock().unwrap() = Some(child.id());
+    }
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(full_prompt.as_bytes())
+            .map_err(|e| format!("Failed to write prompt to {} stdin: {}", binary_name, e))?;
+    }
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture stdout".to_string())?;
+
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture stderr".to_string())?;
+
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut reader = BufReader::new(stderr);
+        let _ = reader.read_to_string(&mut buf);
+        buf
+    });
+
+    let mut reader = BufReader::new(stdout);
+    let mut line_buf = String::new();
+    let mut last_session_id: Option<String> = None;
+    let mut done_sent = false;
+    let mut emitted_message_count: usize = 0;
+
+    loop {
+        if let Some(ref token) = cancel_token {
+            if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                debug_log("Cancel detected — killing AI process");
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(StreamingAttemptState::Cancelled);
+            }
+        }
+
+        line_buf.clear();
+        let read = reader
+            .read_line(&mut line_buf)
+            .map_err(|e| format!("Failed to read {} output: {}", binary_name, e))?;
+
+        if read == 0 {
+            break;
+        }
+
+        let line = line_buf.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        debug_log(&format!("line: {}", line));
+
+        let Ok(json) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+
+        let parsed = parse_codex_stream_line(&json);
+        for mut msg in parsed {
+            match &mut msg {
+                StreamMessage::Init { session_id } => {
+                    last_session_id = Some(session_id.clone());
+                }
+                StreamMessage::Done {
+                    session_id,
+                    result: _,
+                } => {
+                    if session_id.is_none() {
+                        *session_id = last_session_id.clone();
+                    }
+                    done_sent = true;
+                }
+                StreamMessage::Text { .. }
+                | StreamMessage::ToolUse { .. }
+                | StreamMessage::ToolResult { .. }
+                | StreamMessage::TaskNotification { .. }
+                | StreamMessage::Error { .. } => {}
+            }
+
+            if sender.send(msg).is_err() {
+                debug_log("Receiver dropped while streaming; stopping send loop");
+                break;
+            }
+
+            emitted_message_count += 1;
+        }
+    }
+
+    if let Some(ref token) = cancel_token {
+        if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            debug_log("Cancel detected after stdout loop — killing AI process");
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(StreamingAttemptState::Cancelled);
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("{} process wait failed: {}", binary_name, e))?;
+    let stderr_output = stderr_handle.join().unwrap_or_else(|_| "".to_string());
+
+    Ok(StreamingAttemptState::Completed(StreamingAttemptOutcome {
+        done_sent,
+        last_session_id,
+        status_success: status.success(),
+        status_code: status.code(),
+        stderr_output,
+        emitted_message_count,
+    }))
+}
+
+/// Execute a command using the selected AI backend (Codex by default, OMX with --omx)
 pub fn execute_command(
     prompt: &str,
     session_id: Option<&str>,
@@ -349,7 +592,7 @@ pub fn execute_command(
     }
 }
 
-/// Check if Codex CLI is available
+/// Check if selected AI backend CLI is available
 pub fn is_codex_available() -> bool {
     #[cfg(not(unix))]
     {
@@ -372,7 +615,7 @@ pub fn is_ai_supported() -> bool {
     cfg!(unix)
 }
 
-/// Execute a command using Codex CLI with streaming JSON output.
+/// Execute a command using the selected AI backend with streaming JSON output.
 /// If `system_prompt` is None, uses the default system prompt.
 /// If `system_prompt` is Some(""), no system prompt is prepended.
 pub fn execute_command_streaming(
@@ -389,149 +632,72 @@ pub fn execute_command_streaming(
     debug_log("========================================");
 
     let binary_name = ai_binary_name();
-    let codex_bin = get_ai_binary_path().ok_or_else(|| {
+    let backend = backend_kind();
+    let ai_bin = get_ai_binary_path().ok_or_else(|| {
         format!(
             "{} CLI not found. Is {} CLI installed?",
             binary_name, binary_name
         )
     })?;
 
-    let args = codex_args(session_id, working_dir)?;
     let full_prompt = build_full_prompt(prompt, system_prompt, allowed_tools);
-
-    debug_log(&format!("Command: {}", codex_bin));
-    debug_log(&format!("Args: {:?}", args));
     debug_log(&format!("Prompt length: {}", full_prompt.len()));
-
-    let mut child = Command::new(codex_bin)
-        .args(&args)
-        .env_remove("CLAUDECODE")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to start {}: {}", binary_name, e))?;
-
-    if let Some(ref token) = cancel_token {
-        *token.child_pid.lock().unwrap() = Some(child.id());
-    }
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(full_prompt.as_bytes())
-            .map_err(|e| format!("Failed to write prompt to Codex stdin: {}", e))?;
-    }
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Failed to capture stdout".to_string())?;
-
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "Failed to capture stderr".to_string())?;
-
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let mut reader = BufReader::new(stderr);
-        let _ = reader.read_to_string(&mut buf);
-        buf
-    });
-
-    let mut reader = BufReader::new(stdout);
-    let mut line_buf = String::new();
-    let mut last_session_id: Option<String> = None;
-    let mut done_sent = false;
+    let mut attempt_session_id = session_id.map(String::from);
+    let mut retried_without_resume = false;
 
     loop {
-        if let Some(ref token) = cancel_token {
-            if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                debug_log("Cancel detected — killing codex process");
-                let _ = child.kill();
-                let _ = child.wait();
-                return Ok(());
-            }
-        }
+        let args = backend_args(backend, attempt_session_id.as_deref(), working_dir)?;
 
-        line_buf.clear();
-        let read = reader
-            .read_line(&mut line_buf)
-            .map_err(|e| format!("Failed to read Codex output: {}", e))?;
+        debug_log(&format!("Command: {}", ai_bin));
+        debug_log(&format!("Backend: {:?}", backend));
+        debug_log(&format!("Args: {:?}", args));
 
-        if read == 0 {
-            break;
-        }
+        let attempt = execute_command_streaming_once(
+            ai_bin,
+            binary_name,
+            &args,
+            &full_prompt,
+            working_dir,
+            &sender,
+            cancel_token.clone(),
+        )?;
 
-        let line = line_buf.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        debug_log(&format!("line: {}", line));
-
-        let Ok(json) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-
-        let parsed = parse_codex_stream_line(&json);
-        for mut msg in parsed {
-            match &mut msg {
-                StreamMessage::Init { session_id } => {
-                    last_session_id = Some(session_id.clone());
-                }
-                StreamMessage::Done {
-                    session_id,
-                    result: _,
-                } => {
-                    if session_id.is_none() {
-                        *session_id = last_session_id.clone();
-                    }
-                    done_sent = true;
-                }
-                StreamMessage::Text { .. }
-                | StreamMessage::ToolUse { .. }
-                | StreamMessage::ToolResult { .. }
-                | StreamMessage::TaskNotification { .. }
-                | StreamMessage::Error { .. } => {}
-            }
-
-            if sender.send(msg).is_err() {
-                debug_log("Receiver dropped while streaming; stopping send loop");
-                break;
-            }
-        }
-    }
-
-    if let Some(ref token) = cancel_token {
-        if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-            debug_log("Cancel detected after stdout loop — killing codex process");
-            let _ = child.kill();
-            let _ = child.wait();
+        let StreamingAttemptState::Completed(outcome) = attempt else {
             return Ok(());
-        }
-    }
-
-    let status = child
-        .wait()
-        .map_err(|e| format!("Codex process wait failed: {}", e))?;
-
-    let stderr_output = stderr_handle.join().unwrap_or_else(|_| "".to_string());
-
-    if !status.success() {
-        let message = if !stderr_output.trim().is_empty() {
-            stderr_output.trim().to_string()
-        } else {
-            format!("Codex exited with code {:?}", status.code())
         };
-        let _ = sender.send(StreamMessage::Error { message });
-    }
 
-    if !done_sent {
-        let _ = sender.send(StreamMessage::Done {
-            result: String::new(),
-            session_id: last_session_id,
-        });
+        if !outcome.status_success
+            && attempt_session_id.is_some()
+            && !retried_without_resume
+            && outcome.emitted_message_count == 0
+            && is_retryable_resume_error(&outcome.stderr_output)
+        {
+            let stale = attempt_session_id.as_deref().unwrap_or_default();
+            debug_log(&format!(
+                "Detected stale --resume session ({stale}). Retrying without resume."
+            ));
+            attempt_session_id = None;
+            retried_without_resume = true;
+            continue;
+        }
+
+        if !outcome.status_success {
+            let message = if !outcome.stderr_output.trim().is_empty() {
+                outcome.stderr_output.trim().to_string()
+            } else {
+                format!("{} exited with code {:?}", binary_name, outcome.status_code)
+            };
+            let _ = sender.send(StreamMessage::Error { message });
+        }
+
+        if !outcome.done_sent {
+            let _ = sender.send(StreamMessage::Done {
+                result: String::new(),
+                session_id: outcome.last_session_id,
+            });
+        }
+
+        break;
     }
 
     debug_log("======================================");
@@ -541,7 +707,7 @@ pub fn execute_command_streaming(
     Ok(())
 }
 
-/// Parse one Codex JSONL event line into zero or more StreamMessage values.
+/// Parse one Codex/OMX JSONL event line into zero or more StreamMessage values.
 fn parse_codex_stream_line(json: &Value) -> Vec<StreamMessage> {
     let mut messages = Vec::new();
 
@@ -550,6 +716,103 @@ fn parse_codex_stream_line(json: &Value) -> Vec<StreamMessage> {
     };
 
     match event_type {
+        // OMX (Claude-compatible) stream-json init event
+        "system" => {
+            if json.get("subtype").and_then(|v| v.as_str()) == Some("init") {
+                if let Some(session_id) = json.get("session_id").and_then(|v| v.as_str()) {
+                    messages.push(StreamMessage::Init {
+                        session_id: session_id.to_string(),
+                    });
+                }
+            }
+        }
+        // OMX (Claude-compatible) stream-json assistant event
+        "assistant" => {
+            if let Some(content) = json
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|v| v.as_array())
+            {
+                for block in content {
+                    match block.get("type").and_then(|v| v.as_str()) {
+                        Some("text") => {
+                            let text = block
+                                .get("text")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if !text.is_empty() {
+                                messages.push(StreamMessage::Text { content: text });
+                            }
+                        }
+                        Some("tool_use") => {
+                            let name = block
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Tool")
+                                .to_string();
+                            let input = block
+                                .get("input")
+                                .map(|v| {
+                                    if let Some(s) = v.as_str() {
+                                        s.to_string()
+                                    } else {
+                                        serde_json::to_string(v).unwrap_or_else(|_| String::new())
+                                    }
+                                })
+                                .unwrap_or_default();
+                            messages.push(StreamMessage::ToolUse { name, input });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // OMX (Claude-compatible) stream-json final result event
+        "result" => {
+            let result_text = json
+                .get("result")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let session_id = json
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let is_error = json
+                .get("is_error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            if is_error {
+                let errors = json
+                    .get("errors")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+
+                let message = if !errors.is_empty() {
+                    errors
+                } else if !result_text.trim().is_empty() {
+                    result_text.clone()
+                } else {
+                    "OMX execution failed".to_string()
+                };
+
+                messages.push(StreamMessage::Error { message });
+            }
+
+            messages.push(StreamMessage::Done {
+                result: result_text,
+                session_id,
+            });
+        }
+        // Codex stream-json init event
         "thread.started" => {
             if let Some(thread_id) = json.get("thread_id").and_then(|v| v.as_str()) {
                 messages.push(StreamMessage::Init {
@@ -557,6 +820,7 @@ fn parse_codex_stream_line(json: &Value) -> Vec<StreamMessage> {
                 });
             }
         }
+        // Codex stream-json tool start event
         "item.started" => {
             if let Some(item) = json.get("item") {
                 if item.get("type").and_then(|v| v.as_str()) == Some("command_execution") {
@@ -574,6 +838,7 @@ fn parse_codex_stream_line(json: &Value) -> Vec<StreamMessage> {
                 }
             }
         }
+        // Codex stream-json item completion event
         "item.completed" => {
             if let Some(item) = json.get("item") {
                 match item.get("type").and_then(|v| v.as_str()) {
@@ -625,6 +890,7 @@ fn parse_codex_stream_line(json: &Value) -> Vec<StreamMessage> {
                 }
             }
         }
+        // Codex stream-json turn completion event
         "turn.completed" => {
             messages.push(StreamMessage::Done {
                 result: String::new(),
@@ -672,6 +938,29 @@ mod tests {
     }
 
     #[test]
+    fn test_retryable_resume_error_positive_patterns() {
+        assert!(is_retryable_resume_error(
+            "Error: invalid value for '--resume <SESSION_ID>'"
+        ));
+        assert!(is_retryable_resume_error(
+            "thread not found for resume id abc123"
+        ));
+        assert!(is_retryable_resume_error(
+            "Failed to resume session: does not exist"
+        ));
+    }
+
+    #[test]
+    fn test_retryable_resume_error_negative_patterns() {
+        assert!(!is_retryable_resume_error(
+            "network timeout while contacting API"
+        ));
+        assert!(!is_retryable_resume_error(
+            "permission denied while writing file"
+        ));
+    }
+
+    #[test]
     fn test_parse_thread_started() {
         let json = parse_json(r#"{"type":"thread.started","thread_id":"thread-123"}"#);
         let msgs = parse_codex_stream_line(&json);
@@ -679,6 +968,70 @@ mod tests {
         match &msgs[0] {
             StreamMessage::Init { session_id } => assert_eq!(session_id, "thread-123"),
             _ => panic!("expected init message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_omx_init() {
+        let json = parse_json(
+            r#"{"type":"system","subtype":"init","session_id":"54c57e53-7575-4fd6-820a-8432dc14ccb6"}"#,
+        );
+        let msgs = parse_codex_stream_line(&json);
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            StreamMessage::Init { session_id } => {
+                assert_eq!(session_id, "54c57e53-7575-4fd6-820a-8432dc14ccb6")
+            }
+            _ => panic!("expected init message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_omx_assistant_text() {
+        let json = parse_json(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello from OMX"}]}}"#,
+        );
+        let msgs = parse_codex_stream_line(&json);
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            StreamMessage::Text { content } => assert_eq!(content, "Hello from OMX"),
+            _ => panic!("expected text message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_omx_result_success() {
+        let json = parse_json(
+            r#"{"type":"result","is_error":false,"result":"done","session_id":"sess-1"}"#,
+        );
+        let msgs = parse_codex_stream_line(&json);
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0] {
+            StreamMessage::Done { result, session_id } => {
+                assert_eq!(result, "done");
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+            }
+            _ => panic!("expected done message"),
+        }
+    }
+
+    #[test]
+    fn test_parse_omx_result_error() {
+        let json = parse_json(
+            r#"{"type":"result","is_error":true,"errors":["boom"],"result":"","session_id":"sess-2"}"#,
+        );
+        let msgs = parse_codex_stream_line(&json);
+        assert_eq!(msgs.len(), 2);
+        match &msgs[0] {
+            StreamMessage::Error { message } => assert_eq!(message, "boom"),
+            _ => panic!("expected error message"),
+        }
+        match &msgs[1] {
+            StreamMessage::Done { result, session_id } => {
+                assert_eq!(result, "");
+                assert_eq!(session_id.as_deref(), Some("sess-2"));
+            }
+            _ => panic!("expected done message"),
         }
     }
 
@@ -809,5 +1162,120 @@ mod tests {
         assert_eq!(response.response.as_deref(), Some("ok"));
         assert_eq!(response.session_id.as_deref(), Some("thread-1"));
         assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn test_backend_kind_defaults_to_codex() {
+        assert_eq!(backend_kind(), BackendKind::Codex);
+        assert_eq!(ai_binary_name(), "codex");
+    }
+
+    #[test]
+    fn test_codex_args_default_session() {
+        let args = codex_args(None, "/tmp/project").expect("args should build");
+        assert_eq!(
+            args,
+            vec![
+                "-C",
+                "/tmp/project",
+                "--sandbox",
+                "danger-full-access",
+                "-a",
+                "never",
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "-",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_codex_args_resume_session() {
+        let args = codex_args(Some("session-1"), "/tmp/project").expect("args should build");
+        assert_eq!(
+            args,
+            vec![
+                "-C",
+                "/tmp/project",
+                "--sandbox",
+                "danger-full-access",
+                "-a",
+                "never",
+                "exec",
+                "resume",
+                "session-1",
+                "--json",
+                "-",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_omx_args_default_session() {
+        let args = omx_args(None, "/tmp/project").expect("args should build");
+        assert_eq!(
+            args,
+            vec![
+                "--cd",
+                "/tmp/project",
+                "--sandbox",
+                "danger-full-access",
+                "-a",
+                "never",
+                "exec",
+                "--json",
+                "--skip-git-repo-check",
+                "-",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_omx_args_resume_session() {
+        let args = omx_args(Some("session-1"), "/tmp/project").expect("args should build");
+        assert_eq!(
+            args,
+            vec![
+                "--cd",
+                "/tmp/project",
+                "--sandbox",
+                "danger-full-access",
+                "-a",
+                "never",
+                "exec",
+                "resume",
+                "session-1",
+                "--json",
+                "-",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_backend_args_dispatch() {
+        let codex = backend_args(BackendKind::Codex, None, "/tmp/project")
+            .expect("codex args should build");
+        assert!(codex.contains(&"exec".to_string()));
+
+        let omx = backend_args(BackendKind::Omx, Some("session-1"), "/tmp/project")
+            .expect("omx args should build");
+        assert!(omx.contains(&"exec".to_string()));
+        assert!(omx.contains(&"resume".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_ai_binary_path_uses_codex() {
+        let has_codex = std::process::Command::new("which")
+            .arg("codex")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !has_codex {
+            return;
+        }
+
+        let path = resolve_ai_binary_path().expect("codex path should resolve");
+        assert!(path.contains("codex"), "expected codex path, got: {}", path);
     }
 }

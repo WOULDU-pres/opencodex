@@ -1,3 +1,4 @@
+mod app;
 mod codex;
 mod session;
 mod telegram;
@@ -14,11 +15,11 @@ use teloxide::prelude::*;
 #[derive(Parser, Debug)]
 #[command(version, about = "Telegram + Codex/OMX bridge")]
 struct Cli {
-    /// Project directory for Codex execution
+    /// Project directory for Codex/OMX execution
     #[arg(value_name = "PROJECT_DIR")]
     project_dir: Option<String>,
 
-    /// Telegram Bot token (saved to ~/.opencodex/config.json)
+    /// Telegram Bot token (saved to config directory)
     #[arg(long)]
     token: Option<String>,
 
@@ -26,7 +27,7 @@ struct Cli {
     #[arg(long)]
     madmax: bool,
 
-    /// Use omx binary instead of codex
+    /// Use omx binary as AI backend (default: codex)
     #[arg(long)]
     omx: bool,
 
@@ -48,30 +49,18 @@ struct AppConfig {
     token: Option<String>,
 }
 
-fn primary_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".opencodex").join("config.json"))
-}
-
-fn legacy_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".openclaude").join("config.json"))
+fn config_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(app::dir_name()).join("config.json"))
 }
 
 fn load_config() -> AppConfig {
-    let candidates = [primary_config_path(), legacy_config_path()];
-
-    for maybe_path in candidates {
-        let Some(path) = maybe_path else {
-            continue;
-        };
-        let Ok(content) = fs::read_to_string(path) else {
-            continue;
-        };
-        if let Ok(parsed) = serde_json::from_str::<AppConfig>(&content) {
-            return parsed;
-        }
-    }
-
-    AppConfig::default()
+    let Some(path) = config_path() else {
+        return AppConfig::default();
+    };
+    let Ok(content) = fs::read_to_string(path) else {
+        return AppConfig::default();
+    };
+    serde_json::from_str::<AppConfig>(&content).unwrap_or_default()
 }
 
 fn write_config_file(path: &Path, config: &AppConfig) {
@@ -84,10 +73,7 @@ fn write_config_file(path: &Path, config: &AppConfig) {
 }
 
 fn save_config(config: &AppConfig) {
-    if let Some(path) = primary_config_path() {
-        write_config_file(&path, config);
-    }
-    if let Some(path) = legacy_config_path() {
+    if let Some(path) = config_path() {
         write_config_file(&path, config);
     }
 }
@@ -100,16 +86,10 @@ fn resolve_token(cli_token: Option<String>) -> Result<String> {
         return Ok(token);
     }
 
-    if let Ok(token) = env::var("OPENCODEX_TELEGRAM_TOKEN") {
-        if !token.trim().is_empty() {
-            let mut cfg = load_config();
-            cfg.token = Some(token.clone());
-            save_config(&cfg);
-            return Ok(token);
-        }
-    }
+    // Binary-specific env var
+    let bin_env_var = "OPENCODEX_TELEGRAM_TOKEN";
 
-    if let Ok(token) = env::var("OPENCLAUDE_TELEGRAM_TOKEN") {
+    if let Ok(token) = env::var(bin_env_var) {
         if !token.trim().is_empty() {
             let mut cfg = load_config();
             cfg.token = Some(token.clone());
@@ -135,7 +115,10 @@ fn resolve_token(cli_token: Option<String>) -> Result<String> {
     }
 
     anyhow::bail!(
-        "Telegram token not found. Use one of:\n  1) opencodex <project_dir> --token <TOKEN>\n  2) export OPENCODEX_TELEGRAM_TOKEN=<TOKEN>\n  3) export OPENCLAUDE_TELEGRAM_TOKEN=<TOKEN> (legacy)\n  4) save token in ~/.opencodex/config.json"
+        "Telegram token not found. Use one of:\n  1) {} <project_dir> --token <TOKEN>\n  2) export {}=<TOKEN>\n  3) export TELEGRAM_BOT_TOKEN=<TOKEN>\n  4) save token in ~/{}/config.json",
+        env!("CARGO_BIN_NAME"),
+        bin_env_var,
+        app::dir_name(),
     );
 }
 
@@ -198,9 +181,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let project_dir = cli.project_dir.as_deref().context(
-        "Usage: opencodex <project_dir> [--token <TOKEN>] [--madmax] [--omx] (openclaude alias also supported)",
-    )?;
+    let project_dir = cli.project_dir.as_deref().context(format!(
+        "Usage: {} <project_dir> [--token <TOKEN>] [--madmax] [--omx]",
+        env!("CARGO_BIN_NAME"),
+    ))?;
 
     let project_path = Path::new(project_dir);
     if !project_path.exists() || !project_path.is_dir() {
@@ -215,8 +199,16 @@ async fn main() -> Result<()> {
     let token = resolve_token(cli.token)?;
     validate_telegram_token(&token).await?;
 
-    println!("opencodex {}", env!("CARGO_PKG_VERSION"));
+    println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
     println!("project_dir: {}", canonical_project);
+    println!(
+        "ai_backend: {}",
+        if cli.omx {
+            "omx (--omx)"
+        } else {
+            "codex (default)"
+        }
+    );
     println!("status: connecting Telegram bot...");
 
     telegram::run_bot(&token, &canonical_project).await;
