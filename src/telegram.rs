@@ -11,18 +11,15 @@ use teloxide::types::ParseMode;
 use tokio::sync::Mutex;
 
 use crate::codex::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
-use crate::session::{
-    ai_sessions_dir, legacy_ai_sessions_dir, sanitize_user_input, HistoryItem, HistoryType,
-    SessionData,
-};
+use crate::session::{ai_sessions_dir, sanitize_user_input, HistoryItem, HistoryType, SessionData};
 
 /// Per-chat session state
 struct ChatSession {
     session_id: Option<String>,
     current_path: Option<String>,
     history: Vec<HistoryItem>,
-    /// File upload records not yet sent to Codex AI.
-    /// Drained and prepended to the next user prompt so Codex knows about uploaded files.
+    /// File upload records not yet sent to Claude Code AI.
+    /// Drained and prepended to the next user prompt so Claude Code knows about uploaded files.
     pending_uploads: Vec<String>,
     /// Set to true by /clear to prevent a racing polling loop from re-populating history.
     cleared: bool,
@@ -92,14 +89,9 @@ pub fn token_hash(token: &str) -> String {
     hex::encode(&result[..8]) // 16 hex chars
 }
 
-/// Primary bot settings path: ~/.opencodex/bot_settings.json
-fn primary_bot_settings_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".opencodex").join("bot_settings.json"))
-}
-
-/// Legacy bot settings path for backward compatibility: ~/.openclaude/bot_settings.json
-fn legacy_bot_settings_path() -> Option<std::path::PathBuf> {
-    dirs::home_dir().map(|h| h.join(".openclaude").join("bot_settings.json"))
+/// Bot settings path: ~/<app_dir>/bot_settings.json
+fn bot_settings_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(crate::app::dir_name()).join("bot_settings.json"))
 }
 
 fn parse_bot_settings_entry(entry: &serde_json::Value) -> BotSettings {
@@ -164,28 +156,22 @@ fn parse_bot_settings_entry(entry: &serde_json::Value) -> BotSettings {
     }
 }
 
-/// Load bot settings from primary path first, then legacy path.
+/// Load bot settings from the app-specific path.
 fn load_bot_settings(token: &str) -> BotSettings {
     let key = token_hash(token);
-    let candidates = [primary_bot_settings_path(), legacy_bot_settings_path()];
-
-    for maybe_path in candidates {
-        let Some(path) = maybe_path else {
-            continue;
-        };
-        let Ok(content) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-            continue;
-        };
-        let Some(entry) = json.get(&key) else {
-            continue;
-        };
-        return parse_bot_settings_entry(entry);
-    }
-
-    BotSettings::default()
+    let Some(path) = bot_settings_path() else {
+        return BotSettings::default();
+    };
+    let Ok(content) = fs::read_to_string(&path) else {
+        return BotSettings::default();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return BotSettings::default();
+    };
+    let Some(entry) = json.get(&key) else {
+        return BotSettings::default();
+    };
+    parse_bot_settings_entry(entry)
 }
 
 fn write_bot_settings_file(path: &std::path::Path, token: &str, settings: &BotSettings) {
@@ -218,42 +204,24 @@ fn write_bot_settings_file(path: &std::path::Path, token: &str, settings: &BotSe
     }
 }
 
-/// Save bot settings to both primary and legacy paths.
+/// Save bot settings to the app-specific path.
 fn save_bot_settings(token: &str, settings: &BotSettings) {
-    if let Some(path) = primary_bot_settings_path() {
-        write_bot_settings_file(&path, token, settings);
-    }
-    if let Some(path) = legacy_bot_settings_path() {
+    if let Some(path) = bot_settings_path() {
         write_bot_settings_file(&path, token, settings);
     }
 }
 
-/// Resolve a bot token from its hash by searching primary then legacy bot settings files.
+/// Resolve a bot token from its hash by searching the app-specific bot settings file.
 pub fn resolve_token_by_hash(hash: &str) -> Option<String> {
-    let candidates = [primary_bot_settings_path(), legacy_bot_settings_path()];
-
-    for maybe_path in candidates {
-        let Some(path) = maybe_path else {
-            continue;
-        };
-        let Ok(content) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
-            continue;
-        };
-        let Some(obj) = json.as_object() else {
-            continue;
-        };
-        let Some(entry) = obj.get(hash) else {
-            continue;
-        };
-        if let Some(token) = entry.get("token").and_then(|v| v.as_str()) {
-            return Some(token.to_string());
-        }
-    }
-
-    None
+    let path = bot_settings_path()?;
+    let content = fs::read_to_string(&path).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let obj = json.as_object()?;
+    let entry = obj.get(hash)?;
+    entry
+        .get("token")
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 /// Normalize tool name: first letter uppercase, rest lowercase
@@ -325,7 +293,7 @@ fn risk_badge(destructive: bool) -> &'static str {
 }
 
 /// Entry point: start the Telegram bot with long polling.
-/// `default_project_dir` is the working directory bound by `opencodex <project_dir>`.
+/// `default_project_dir` is the working directory bound by the CLI binary.
 pub async fn run_bot(token: &str, default_project_dir: &str) {
     let bot = Bot::new(token);
     let bot_settings = load_bot_settings(token);
@@ -335,6 +303,7 @@ pub async fn run_bot(token: &str, default_project_dir: &str) {
         teloxide::types::BotCommand::new("help", "Show help"),
         teloxide::types::BotCommand::new("start", "Start session at directory"),
         teloxide::types::BotCommand::new("pwd", "Show current working directory"),
+        teloxide::types::BotCommand::new("cd", "Change working directory"),
         teloxide::types::BotCommand::new("clear", "Clear AI conversation history"),
         teloxide::types::BotCommand::new("stop", "Stop current AI request"),
         teloxide::types::BotCommand::new("down", "Download file from server"),
@@ -585,6 +554,9 @@ async fn handle_message(
     } else if text.starts_with("/pwd") {
         println!("  [{timestamp}] ◀ [{user_name}] /pwd");
         handle_pwd_command(&bot, chat_id, &state).await?;
+    } else if text.starts_with("/cd") {
+        println!("  [{timestamp}] ◀ [{user_name}] /cd {}", text.strip_prefix("/cd").unwrap_or("").trim());
+        handle_cd_command(&bot, chat_id, &text, &state).await?;
     } else if text.starts_with("/down") {
         println!(
             "  [{timestamp}] ◀ [{user_name}] /down {}",
@@ -635,14 +607,16 @@ async fn handle_help_command(
     chat_id: ChatId,
     state: &SharedState,
 ) -> ResponseResult<()> {
-    let help = "\
-<b>opencodex Telegram Bot</b>
-Manage server files &amp; chat with Codex AI.
+    let help = format!(
+        "\
+<b>{} Telegram Bot</b>
+Manage server files &amp; chat with Codex AI (or OMX with <code>--omx</code>).
 
 <b>Session</b>
 <code>/start &lt;path&gt;</code> — Start session at directory
 <code>/start</code> — Start in default startup project directory
 <code>/pwd</code> — Show current working directory
+<code>/cd &lt;path&gt;</code> — Change working directory
 <code>/clear</code> — Clear AI conversation history
 <code>/stop</code> — Stop current AI request
 
@@ -655,8 +629,13 @@ Send a file/photo — Upload to session directory
   e.g. <code>!ls -la</code>, <code>!git status</code>
 
 <b>AI Chat</b>
-Any other message is sent to Codex AI.
+Any other message is sent to the configured AI backend.
 AI can read, edit, and run commands in your session.
+
+<b>Backend</b>
+Default backend: <code>codex</code>
+Start server with <code>--omx</code> to route chats to <code>omx</code>
+OMX team jobs run inside CLI sessions (e.g. <code>omx team 3:executor \"task\"</code>)
 
 <b>Tool Management</b>
 <code>/availabletools</code> — List all available tools
@@ -670,7 +649,9 @@ AI can read, edit, and run commands in your session.
 <code>/public on</code> — Allow all members to use bot
 <code>/public off</code> — Owner only (default)
 
-<code>/help</code> — Show this help";
+<code>/help</code> — Show this help",
+        env!("CARGO_BIN_NAME")
+    );
 
     shared_rate_limit_wait(state, chat_id).await;
     bot.send_message(chat_id, help)
@@ -869,6 +850,98 @@ async fn handle_pwd_command(bot: &Bot, chat_id: ChatId, state: &SharedState) -> 
                 .await?
         }
     };
+
+    Ok(())
+}
+
+/// Handle /cd command - change working directory without resetting session
+async fn handle_cd_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    state: &SharedState,
+) -> ResponseResult<()> {
+    let path_str = text.strip_prefix("/cd").unwrap_or("").trim();
+
+    // No argument: show current path (like /pwd)
+    if path_str.is_empty() {
+        let current_path = {
+            let data = state.lock().await;
+            data.sessions
+                .get(&chat_id)
+                .and_then(|s| s.current_path.clone())
+        };
+        shared_rate_limit_wait(state, chat_id).await;
+        match current_path {
+            Some(path) => bot.send_message(chat_id, format!("Current: {path}")).await?,
+            None => {
+                bot.send_message(chat_id, "No active session. Use /start <path> first.")
+                    .await?
+            }
+        };
+        return Ok(());
+    }
+
+    // Expand ~ to home directory
+    let expanded = if path_str.starts_with("~/") || path_str == "~" {
+        if let Some(home) = dirs::home_dir() {
+            home.join(path_str.strip_prefix("~/").unwrap_or(""))
+                .display()
+                .to_string()
+        } else {
+            path_str.to_string()
+        }
+    } else if path_str.starts_with('/') {
+        path_str.to_string()
+    } else {
+        // Relative path: resolve against current_path
+        let base = {
+            let data = state.lock().await;
+            data.sessions
+                .get(&chat_id)
+                .and_then(|s| s.current_path.clone())
+        };
+        match base {
+            Some(b) => Path::new(&b).join(path_str).display().to_string(),
+            None => {
+                shared_rate_limit_wait(state, chat_id).await;
+                bot.send_message(chat_id, "No active session. Use /start <path> first.")
+                    .await?;
+                return Ok(());
+            }
+        }
+    };
+
+    // Validate path
+    let path = Path::new(&expanded);
+    if !path.exists() || !path.is_dir() {
+        shared_rate_limit_wait(state, chat_id).await;
+        bot.send_message(chat_id, format!("Error: not a valid directory: {expanded}"))
+            .await?;
+        return Ok(());
+    }
+
+    let canonical = path
+        .canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or(expanded);
+
+    // Update only current_path, preserve session and history
+    {
+        let mut data = state.lock().await;
+        if let Some(session) = data.sessions.get_mut(&chat_id) {
+            session.current_path = Some(canonical.clone());
+        } else {
+            shared_rate_limit_wait(state, chat_id).await;
+            bot.send_message(chat_id, "No active session. Use /start <path> first.")
+                .await?;
+            return Ok(());
+        }
+    }
+
+    shared_rate_limit_wait(state, chat_id).await;
+    bot.send_message(chat_id, format!("Changed to: {canonical}"))
+        .await?;
 
     Ok(())
 }
@@ -1079,7 +1152,7 @@ async fn handle_file_upload(
         }
     }
 
-    // Record upload in session history and pending queue for Codex
+    // Record upload in session history and pending queue for Claude Code
     let upload_record = format!(
         "[File uploaded] {} → {} ({} bytes)",
         file_name,
@@ -1438,7 +1511,7 @@ async fn handle_public_command(
     Ok(())
 }
 
-/// Handle regular text messages - send to Codex AI
+/// Handle regular text messages - send to Claude Code AI
 async fn handle_text_message(
     bot: &Bot,
     chat_id: ChatId,
@@ -1457,7 +1530,7 @@ async fn handle_text_message(
             })
         });
         let tools = get_allowed_tools(&data.settings, chat_id);
-        // Drain pending uploads so they are sent to Codex exactly once
+        // Drain pending uploads so they are sent to Claude exactly once
         let uploads = data
             .sessions
             .get_mut(&chat_id)
@@ -1491,7 +1564,7 @@ async fn handle_text_message(
     // Sanitize input
     let sanitized_input = sanitize_user_input(user_text);
 
-    // Prepend pending file upload records so Codex knows about recently uploaded files
+    // Prepend pending file upload records so Claude knows about recently uploaded files
     let context_prompt = if pending_uploads.is_empty() {
         sanitized_input
     } else {
@@ -1528,16 +1601,18 @@ async fn handle_text_message(
          Current working directory: {}\n\n\
          When your work produces a file the user would want (generated code, reports, images, archives, etc.),\n\
          send it by running this bash command:\n\n\
-         opencodex --sendfile <filepath> --chat {} --key {}\n\n\
+         {} --sendfile <filepath> --chat {} --key {}\n\n\
          This delivers the file directly to the user's Telegram chat.\n\
-         Do NOT tell the user to use /down — use the command above instead. (legacy alias: openclaude)\n\n\
+         Do NOT tell the user to use /down — use the command above instead.\n\n\
          Always keep the user informed about what you are doing. \
          Briefly explain each step as you work (e.g. \"Reading the file...\", \"Creating the script...\", \"Running tests...\"). \
          The user cannot see your tool calls, so narrate your progress so they know what is happening.\n\n\
+         For OMX multi-agent orchestration requests, use the shell command pattern \
+         <code>omx team ...</code> directly (e.g. <code>omx team 3:executor \"task\"</code>).\n\n\
          IMPORTANT: The user is on Telegram and CANNOT interact with any interactive prompts, dialogs, or confirmation requests. \
          All tools that require user interaction (such as AskUserQuestion, EnterPlanMode, ExitPlanMode) will NOT work. \
          Never use tools that expect user interaction. If you need clarification, just ask in plain text.{}",
-        current_path, chat_id.0, token_hash(bot.token()), disabled_notice
+        current_path, env!("CARGO_BIN_NAME"), chat_id.0, token_hash(bot.token()), disabled_notice
     );
 
     // Create cancel token for this request
@@ -1554,7 +1629,7 @@ async fn handle_text_message(
     let current_path_clone = current_path.clone();
     let cancel_token_clone = cancel_token.clone();
 
-    // Run Codex in a blocking thread
+    // Run Claude Code in a blocking thread
     tokio::task::spawn_blocking(move || {
         let result = codex::execute_command_streaming(
             &context_prompt,
@@ -1813,7 +1888,7 @@ async fn handle_text_message(
             println!("  [{ts}] ■ Stopped");
 
             // Record user message + stopped response in history
-            // (Codex session context already has this interaction)
+            // (Claude session context already has this interaction)
             // Skip if session was cleared while we were running (race with /clear)
             let mut data = state_owned.lock().await;
             if let Some(session) = data.sessions.get_mut(&chat_id) {
@@ -1947,39 +2022,36 @@ async fn handle_text_message(
     Ok(())
 }
 
-/// Load existing session from primary and legacy session directories matching the given path
+/// Load existing session from the session directory matching the given path
 fn load_existing_session(current_path: &str) -> Option<(SessionData, std::time::SystemTime)> {
     let mut matching_session: Option<(SessionData, std::time::SystemTime)> = None;
-    let candidates = [ai_sessions_dir(), legacy_ai_sessions_dir()];
 
-    for maybe_dir in candidates {
-        let Some(sessions_dir) = maybe_dir else {
-            continue;
-        };
+    let Some(sessions_dir) = ai_sessions_dir() else {
+        return None;
+    };
 
-        if !sessions_dir.exists() {
-            continue;
-        }
+    if !sessions_dir.exists() {
+        return None;
+    }
 
-        let Ok(entries) = fs::read_dir(&sessions_dir) else {
-            continue;
-        };
+    let Ok(entries) = fs::read_dir(&sessions_dir) else {
+        return None;
+    };
 
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    if let Ok(session_data) = serde_json::from_str::<SessionData>(&content) {
-                        if session_data.current_path == current_path {
-                            if let Ok(metadata) = path.metadata() {
-                                if let Ok(modified) = metadata.modified() {
-                                    match &matching_session {
-                                        None => matching_session = Some((session_data, modified)),
-                                        Some((_, latest_time)) if modified > *latest_time => {
-                                            matching_session = Some((session_data, modified));
-                                        }
-                                        _ => {}
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().map(|e| e == "json").unwrap_or(false) {
+            if let Ok(content) = fs::read_to_string(&path) {
+                if let Ok(session_data) = serde_json::from_str::<SessionData>(&content) {
+                    if session_data.current_path == current_path {
+                        if let Ok(metadata) = path.metadata() {
+                            if let Ok(modified) = metadata.modified() {
+                                match &matching_session {
+                                    None => matching_session = Some((session_data, modified)),
+                                    Some((_, latest_time)) if modified > *latest_time => {
+                                        matching_session = Some((session_data, modified));
                                     }
+                                    _ => {}
                                 }
                             }
                         }
@@ -2040,11 +2112,8 @@ fn save_session_to_file(session: &ChatSession, current_path: &str) {
         created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
     };
 
-    if let Some(primary_dir) = ai_sessions_dir() {
-        write_session_file(&primary_dir, &session_data);
-    }
-    if let Some(legacy_dir) = legacy_ai_sessions_dir() {
-        write_session_file(&legacy_dir, &session_data);
+    if let Some(sessions_dir) = ai_sessions_dir() {
+        write_session_file(&sessions_dir, &session_data);
     }
 }
 
