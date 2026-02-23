@@ -1,4 +1,5 @@
 mod app;
+mod auth;
 mod codex;
 mod session;
 mod telegram;
@@ -68,7 +69,14 @@ fn write_config_file(path: &Path, config: &AppConfig) {
         let _ = fs::create_dir_all(parent);
     }
     if let Ok(serialized) = serde_json::to_string_pretty(config) {
-        let _ = fs::write(path, serialized);
+        let _ = fs::write(path, &serialized);
+
+        // Protect token file: owner-only read/write (0o600)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
     }
 }
 
