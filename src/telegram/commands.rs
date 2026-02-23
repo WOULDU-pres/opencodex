@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -7,6 +8,8 @@ use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 
 use crate::auth;
+use crate::codex;
+use crate::i18n;
 use crate::session::HistoryType;
 
 use super::bot::{ChatSession, SharedData, SharedState};
@@ -26,17 +29,18 @@ pub async fn run_bot(token: &str, default_project_dir: &str) {
 
     // Register bot commands for autocomplete
     let commands = vec![
-        teloxide::types::BotCommand::new("help", "Show help"),
-        teloxide::types::BotCommand::new("start", "Start session at directory"),
-        teloxide::types::BotCommand::new("pwd", "Show current working directory"),
-        teloxide::types::BotCommand::new("cd", "Change working directory"),
-        teloxide::types::BotCommand::new("clear", "Clear AI conversation history"),
-        teloxide::types::BotCommand::new("stop", "Stop current AI request"),
-        teloxide::types::BotCommand::new("down", "Download file from server"),
-        teloxide::types::BotCommand::new("public", "Toggle public access (group only)"),
-        teloxide::types::BotCommand::new("availabletools", "List all available tools"),
-        teloxide::types::BotCommand::new("allowedtools", "Show currently allowed tools"),
-        teloxide::types::BotCommand::new("allowed", "Add/remove tool (+name / -name)"),
+        teloxide::types::BotCommand::new("help", "도움말"),
+        teloxide::types::BotCommand::new("start", "세션 시작"),
+        teloxide::types::BotCommand::new("pwd", "현재 경로 확인"),
+        teloxide::types::BotCommand::new("cd", "작업 경로 변경"),
+        teloxide::types::BotCommand::new("clear", "대화 히스토리 초기화"),
+        teloxide::types::BotCommand::new("stop", "진행 중 작업 중단"),
+        teloxide::types::BotCommand::new("status", "런타임 상태 확인"),
+        teloxide::types::BotCommand::new("down", "서버 파일 다운로드"),
+        teloxide::types::BotCommand::new("public", "그룹 공개 모드 전환"),
+        teloxide::types::BotCommand::new("availabletools", "전체 도구 목록"),
+        teloxide::types::BotCommand::new("allowedtools", "허용 도구 목록"),
+        teloxide::types::BotCommand::new("allowed", "도구 허용/해제"),
     ];
     if let Err(e) = bot.set_my_commands(commands).await {
         println!("  ⚠ Failed to set bot commands: {e}");
@@ -51,6 +55,7 @@ pub async fn run_bot(token: &str, default_project_dir: &str) {
         sessions: HashMap::new(),
         settings: bot_settings,
         cancel_tokens: HashMap::new(),
+        shell_pids: HashMap::new(),
         stop_message_ids: HashMap::new(),
         api_timestamps: HashMap::new(),
     }));
@@ -92,7 +97,7 @@ async fn handle_message(
         return Ok(());
     };
     let is_group_chat = matches!(msg.chat.kind, teloxide::types::ChatKind::Public(_));
-    let imprinted = {
+    let (imprinted, rejected_private) = {
         let mut data = state.lock().await;
         match data.settings.owner_user_id {
             None => {
@@ -100,7 +105,7 @@ async fn handle_message(
                 data.settings.owner_user_id = Some(uid);
                 save_bot_settings(token, &data.settings);
                 println!("  [{timestamp}] ★ Owner registered: {raw_user_name} (id:{uid})");
-                true
+                (true, false)
             }
             Some(owner_id) => {
                 if uid != owner_id {
@@ -114,20 +119,31 @@ async fn handle_message(
                             .copied()
                             .unwrap_or(false);
                     if !is_public {
-                        // Unregistered user -> reject silently (log only)
+                        // Unregistered user -> reject with guidance
                         println!("  [{timestamp}] ✗ Rejected: {raw_user_name} (id:{uid})");
-                        return Ok(());
+                        (false, true)
+                    } else {
+                        // Public group chat: allow non-owner user
+                        println!(
+                            "  [{timestamp}] ○ [{raw_user_name}(id:{uid})] Public group access"
+                        );
+                        (false, false)
                     }
-                    // Public group chat: allow non-owner user
-                    println!("  [{timestamp}] ○ [{raw_user_name}(id:{uid})] Public group access");
+                } else {
+                    (false, false)
                 }
-                false
             }
         }
     };
+    if rejected_private {
+        shared_rate_limit_wait(&state, chat_id).await;
+        bot.send_message(chat_id, i18n::MSG_PRIVATE_BOT).await?;
+        return Ok(());
+    }
     if imprinted {
-        // Owner registration is logged to server console only
-        // No response sent to the user
+        shared_rate_limit_wait(&state, chat_id).await;
+        bot.send_message(chat_id, i18n::MSG_OWNER_REGISTERED)
+            .await?;
     }
 
     let is_owner = {
@@ -184,8 +200,7 @@ async fn handle_message(
                     };
                     if ai_busy {
                         shared_rate_limit_wait(&state, chat_id).await;
-                        bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
-                            .await?;
+                        bot.send_message(chat_id, i18n::MSG_AI_BUSY).await?;
                     } else {
                         handle_text_message(&bot, chat_id, text, &state).await?;
                     }
@@ -287,8 +302,7 @@ async fn handle_message(
         if data.cancel_tokens.contains_key(&chat_id) {
             drop(data);
             shared_rate_limit_wait(&state, chat_id).await;
-            bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
-                .await?;
+            bot.send_message(chat_id, i18n::MSG_AI_BUSY).await?;
             return Ok(());
         }
     }
@@ -309,6 +323,9 @@ async fn handle_message(
     } else if text.starts_with("/pwd") {
         println!("  [{timestamp}] ◀ [{user_name}] /pwd");
         handle_pwd_command(&bot, chat_id, &state).await?;
+    } else if text.starts_with("/status") {
+        println!("  [{timestamp}] ◀ [{user_name}] /status");
+        handle_status_command(&bot, chat_id, &state).await?;
     } else if text.starts_with("/cd") {
         println!(
             "  [{timestamp}] ◀ [{user_name}] /cd {}",
@@ -365,56 +382,84 @@ async fn handle_help_command(
     chat_id: ChatId,
     state: &SharedState,
 ) -> ResponseResult<()> {
-    let help = format!(
-        "\
-<b>{} Telegram Bot</b>
-Manage server files &amp; chat with Codex AI (or OMX with <code>--omx</code>).
-
-<b>Session</b>
-<code>/start &lt;path&gt;</code> — Start session at directory
-<code>/start</code> — Start in default startup project directory
-<code>/pwd</code> — Show current working directory
-<code>/cd &lt;path&gt;</code> — Change working directory
-<code>/clear</code> — Clear AI conversation history
-<code>/stop</code> — Stop current AI request
-
-<b>File Transfer</b>
-<code>/down &lt;file&gt;</code> — Download file from server
-Send a file/photo — Upload to session directory
-
-<b>Shell</b>
-<code>!&lt;command&gt;</code> — Run shell command directly
-  e.g. <code>!ls -la</code>, <code>!git status</code>
-
-<b>AI Chat</b>
-Any other message is sent to the configured AI backend.
-AI can read, edit, and run commands in your session.
-
-<b>Backend</b>
-Default backend: <code>codex</code>
-Start server with <code>--omx</code> to route chats to <code>omx</code>
-OMX team jobs run inside CLI sessions (e.g. <code>omx team 3:executor \"task\"</code>)
-
-<b>Tool Management</b>
-<code>/availabletools</code> — List all available tools
-<code>/allowedtools</code> — Show currently allowed tools
-<code>/allowed +name</code> — Add tool (e.g. <code>/allowed +Bash</code>)
-<code>/allowed -name</code> — Remove tool
-
-<b>Group Chat</b>
-<code>;</code><i>message</i> — Send message to AI
-<code>;</code><i>caption</i> — Upload file with AI prompt
-<code>/public on</code> — Allow all members to use bot
-<code>/public off</code> — Owner only (default)
-
-<code>/help</code> — Show this help",
-        env!("CARGO_BIN_NAME")
-    );
+    let help = i18n::HELP_TEXT_TEMPLATE.replace("{app}", env!("CARGO_BIN_NAME"));
 
     shared_rate_limit_wait(state, chat_id).await;
     bot.send_message(chat_id, help)
         .parse_mode(ParseMode::Html)
         .await?;
+
+    Ok(())
+}
+
+/// Handle /status command - show current runtime state
+async fn handle_status_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &SharedState,
+) -> ResponseResult<()> {
+    let (path, session_id, history_len, ai_active) = {
+        let data = state.lock().await;
+        let session = data.sessions.get(&chat_id);
+        (
+            session
+                .and_then(|s| s.current_path.clone())
+                .unwrap_or_else(|| "-".to_string()),
+            session
+                .and_then(|s| s.session_id.clone())
+                .unwrap_or_else(|| "-".to_string()),
+            session.map(|s| s.history.len()).unwrap_or(0),
+            data.cancel_tokens.contains_key(&chat_id),
+        )
+    };
+
+    let backend_path = codex::get_ai_binary_path();
+    let backend_name = backend_path
+        .and_then(|p| {
+            Path::new(p)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "unavailable".to_string());
+    let backend_version = backend_path
+        .and_then(|path| {
+            Command::new(path)
+                .arg("--version")
+                .output()
+                .ok()
+                .and_then(|output| {
+                    if output.status.success() {
+                        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                        if !stdout.is_empty() {
+                            Some(stdout)
+                        } else {
+                            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                            (!stderr.is_empty()).then_some(stderr)
+                        }
+                    } else {
+                        None
+                    }
+                })
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let ai_state = if ai_active { "running" } else { "idle" };
+
+    let message = format!(
+        "Status\n\
+path: {path}\n\
+session_id: {session_id}\n\
+history_len: {history_len}\n\
+active_ai: {ai_state}\n\
+backend: {backend_name}\n\
+backend_version: {backend_version}\n\
+app_version: {} {}",
+        env!("CARGO_BIN_NAME"),
+        env!("CARGO_PKG_VERSION")
+    );
+
+    shared_rate_limit_wait(state, chat_id).await;
+    bot.send_message(chat_id, message).await?;
 
     Ok(())
 }
@@ -588,7 +633,7 @@ async fn handle_clear_command(
     }
 
     shared_rate_limit_wait(state, chat_id).await;
-    bot.send_message(chat_id, "Session cleared.").await?;
+    bot.send_message(chat_id, i18n::MSG_SESSION_CLEARED).await?;
 
     Ok(())
 }
@@ -605,10 +650,7 @@ async fn handle_pwd_command(bot: &Bot, chat_id: ChatId, state: &SharedState) -> 
     shared_rate_limit_wait(state, chat_id).await;
     match current_path {
         Some(path) => bot.send_message(chat_id, &path).await?,
-        None => {
-            bot.send_message(chat_id, "No active session. Use /start <path> first.")
-                .await?
-        }
+        None => bot.send_message(chat_id, i18n::MSG_NO_SESSION).await?,
     };
 
     Ok(())
@@ -638,10 +680,7 @@ async fn handle_cd_command(
                 bot.send_message(chat_id, format!("Current: {path}"))
                     .await?
             }
-            None => {
-                bot.send_message(chat_id, "No active session. Use /start <path> first.")
-                    .await?
-            }
+            None => bot.send_message(chat_id, i18n::MSG_NO_SESSION).await?,
         };
         return Ok(());
     }
@@ -669,8 +708,7 @@ async fn handle_cd_command(
             Some(b) => Path::new(&b).join(path_str).display().to_string(),
             None => {
                 shared_rate_limit_wait(state, chat_id).await;
-                bot.send_message(chat_id, "No active session. Use /start <path> first.")
-                    .await?;
+                bot.send_message(chat_id, i18n::MSG_NO_SESSION).await?;
                 return Ok(());
             }
         }
@@ -697,8 +735,7 @@ async fn handle_cd_command(
             session.current_path = Some(canonical.clone());
         } else {
             shared_rate_limit_wait(state, chat_id).await;
-            bot.send_message(chat_id, "No active session. Use /start <path> first.")
-                .await?;
+            bot.send_message(chat_id, i18n::MSG_NO_SESSION).await?;
             return Ok(());
         }
 
@@ -722,21 +759,28 @@ async fn handle_stop_command(
     chat_id: ChatId,
     state: &SharedState,
 ) -> ResponseResult<()> {
-    let token = {
-        let data = state.lock().await;
-        data.cancel_tokens.get(&chat_id).cloned()
+    let (token, shell_pid) = {
+        let mut data = state.lock().await;
+        let token = data.cancel_tokens.get(&chat_id).cloned();
+        let shell_pid = data.shell_pids.remove(&chat_id);
+        (token, shell_pid)
     };
+    let has_ai_token = token.is_some();
 
-    match token {
-        Some(token) => {
-            // Ignore duplicate /stop if already cancelled
-            if token.cancelled.load(Ordering::Relaxed) {
-                return Ok(());
-            }
+    if token.is_none() && shell_pid.is_none() {
+        shared_rate_limit_wait(state, chat_id).await;
+        bot.send_message(chat_id, i18n::MSG_NO_ACTIVE_REQUEST)
+            .await?;
+        return Ok(());
+    }
 
+    // Cancel AI request if present.
+    if let Some(token) = token {
+        // Ignore duplicate /stop for AI, but still allow shell cancellation below.
+        if !token.cancelled.load(Ordering::Relaxed) {
             // Send immediate feedback to user
             shared_rate_limit_wait(state, chat_id).await;
-            let stop_msg = bot.send_message(chat_id, "Stopping...").await?;
+            let stop_msg = bot.send_message(chat_id, i18n::MSG_STOPPING).await?;
 
             // Store the stop message ID so the polling loop can update it later
             {
@@ -763,11 +807,25 @@ async fn handle_stop_command(
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ■ Cancel signal sent");
         }
-        None => {
-            shared_rate_limit_wait(state, chat_id).await;
-            bot.send_message(chat_id, "No active request to stop.")
-                .await?;
+    }
+
+    // Stop running shell command if present.
+    if let Some(pid) = shell_pid {
+        #[cfg(unix)]
+        // SAFETY: sending SIGTERM to stop the running shell process for this chat
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
+
+        if !has_ai_token {
+            // Shell-only stop path still provides immediate feedback.
+            shared_rate_limit_wait(state, chat_id).await;
+            bot.send_message(chat_id, i18n::MSG_STOPPING).await?;
+        }
+
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!("  [{ts}] ■ Shell stop signal sent (pid:{pid})");
     }
 
     Ok(())

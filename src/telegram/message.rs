@@ -6,7 +6,8 @@ use teloxide::prelude::*;
 use teloxide::types::ParseMode;
 
 use crate::codex::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
-use crate::session::{sanitize_user_input, HistoryItem, HistoryType};
+use crate::i18n;
+use crate::session::{enforce_history_cap, sanitize_user_input, HistoryItem, HistoryType};
 
 use super::bot::{SharedState, TELEGRAM_MSG_LIMIT};
 use super::storage::{save_session_to_file, token_hash};
@@ -50,8 +51,7 @@ pub(super) async fn handle_text_message(
         Some(info) => info,
         None => {
             shared_rate_limit_wait(state, chat_id).await;
-            bot.send_message(chat_id, "No active session. Use /start <path> first.")
-                .await?;
+            bot.send_message(chat_id, i18n::MSG_NO_SESSION).await?;
             return Ok(());
         }
     };
@@ -66,7 +66,11 @@ pub(super) async fn handle_text_message(
     let placeholder_msg_id = placeholder.id;
 
     // Sanitize input
-    let sanitized_input = sanitize_user_input(user_text);
+    let (sanitized_input, was_filtered) = sanitize_user_input(user_text);
+    if was_filtered {
+        shared_rate_limit_wait(state, chat_id).await;
+        let _ = bot.send_message(chat_id, i18n::MSG_FILTER_NOTICE).await;
+    }
 
     // Prepend pending file upload records so Claude knows about recently uploaded files
     let context_prompt = if pending_uploads.is_empty() {
@@ -412,6 +416,7 @@ pub(super) async fn handle_text_message(
                         item_type: HistoryType::Assistant,
                         content: stopped_response,
                     });
+                    enforce_history_cap(&mut session.history);
 
                     save_session_to_file(session, &current_path);
                 }
@@ -425,7 +430,7 @@ pub(super) async fn handle_text_message(
 
         // Final response
         if full_response.is_empty() {
-            full_response = "(No response)".to_string();
+            full_response = i18n::MSG_NO_RESPONSE.to_string();
         }
 
         let full_response = normalize_empty_lines(&full_response);
@@ -515,6 +520,7 @@ pub(super) async fn handle_text_message(
                         item_type: HistoryType::Assistant,
                         content: full_response,
                     });
+                    enforce_history_cap(&mut session.history);
 
                     save_session_to_file(session, &current_path);
                 }

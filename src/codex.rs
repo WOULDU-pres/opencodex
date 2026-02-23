@@ -77,20 +77,26 @@ fn resolve_ai_binary_path() -> Option<String> {
     None
 }
 
-fn get_ai_binary_path() -> Option<&'static str> {
+pub(crate) fn get_ai_binary_path() -> Option<&'static str> {
     AI_BINARY_PATH
         .get_or_init(resolve_ai_binary_path)
         .as_deref()
 }
 
-/// Debug logging helper (active only when COKACDIR_DEBUG=1)
+fn debug_enabled_from_values(primary: Option<&str>, legacy: Option<&str>) -> bool {
+    primary.or(legacy).map(|v| v.trim() == "1").unwrap_or(false)
+}
+
+fn debug_enabled_from_env() -> bool {
+    let primary = std::env::var("OPENCLAUDE_DEBUG").ok();
+    let legacy = std::env::var("COKACDIR_DEBUG").ok();
+    debug_enabled_from_values(primary.as_deref(), legacy.as_deref())
+}
+
+/// Debug logging helper (active when OPENCLAUDE_DEBUG=1, or legacy COKACDIR_DEBUG=1)
 fn debug_log(msg: &str) {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    let enabled = ENABLED.get_or_init(|| {
-        std::env::var("COKACDIR_DEBUG")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    });
+    let enabled = ENABLED.get_or_init(debug_enabled_from_env);
     if !*enabled {
         return;
     }
@@ -1178,6 +1184,14 @@ mod tests {
     fn test_backend_kind_defaults_to_codex() {
         assert_eq!(backend_kind(), BackendKind::Codex);
         assert_eq!(ai_binary_name(), "codex");
+    }
+
+    #[test]
+    fn test_debug_env_var_new_name() {
+        assert!(debug_enabled_from_values(Some("1"), None));
+        assert!(!debug_enabled_from_values(Some("0"), Some("1")));
+        assert!(debug_enabled_from_values(None, Some("1")));
+        assert!(!debug_enabled_from_values(None, Some("0")));
     }
 
     #[test]

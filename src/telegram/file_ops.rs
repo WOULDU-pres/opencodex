@@ -1,14 +1,18 @@
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use teloxide::prelude::*;
 
 use crate::auth;
-use crate::session::{HistoryItem, HistoryType};
+use crate::i18n;
+use crate::session::{enforce_history_cap, HistoryItem, HistoryType};
 
 use super::bot::SharedState;
 use super::storage::save_session_to_file;
 use super::streaming::{html_escape, send_long_message, shared_rate_limit_wait};
+
+const SHELL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Handle /down <filepath> - send file to user
 pub(super) async fn handle_down_command(
@@ -43,11 +47,7 @@ pub(super) async fn handle_down_command(
             Some(base) => format!("{}/{}", base.trim_end_matches('/'), file_path),
             None => {
                 shared_rate_limit_wait(state, chat_id).await;
-                bot.send_message(
-                    chat_id,
-                    "No active session. Use absolute path or /start <path> first.",
-                )
-                .await?;
+                bot.send_message(chat_id, i18n::MSG_NO_SESSION).await?;
                 return Ok(());
             }
         }
@@ -91,8 +91,7 @@ pub(super) async fn handle_file_upload(
 
     let Some(save_dir) = current_path else {
         shared_rate_limit_wait(state, chat_id).await;
-        bot.send_message(chat_id, "No active session. Use /start <path> first.")
-            .await?;
+        bot.send_message(chat_id, i18n::MSG_NO_SESSION).await?;
         return Ok(());
     };
 
@@ -190,6 +189,7 @@ pub(super) async fn handle_file_upload(
                 item_type: HistoryType::User,
                 content: upload_record.clone(),
             });
+            enforce_history_cap(&mut session.history);
             session.pending_uploads.push(upload_record);
             save_session_to_file(session, &save_dir);
         }
@@ -232,21 +232,63 @@ pub(super) async fn handle_shell_command(
 
     let cmd_owned = cmd_str.to_string();
     let working_dir_clone = working_dir.clone();
+    let state_for_blocking = state.clone();
 
     // Run shell command in blocking thread with stdin closed and timeout
     let result = tokio::task::spawn_blocking(move || {
-        let child = std::process::Command::new("bash")
+        let mut child = std::process::Command::new("bash")
             .args(["-c", &cmd_owned])
             .current_dir(&working_dir_clone)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .spawn();
+            .spawn()
+            .map_err(|e| e.to_string())?;
 
-        match child {
-            Ok(child) => child.wait_with_output(),
-            Err(e) => Err(e),
+        let shell_pid = child.id();
+        {
+            let mut data = state_for_blocking.blocking_lock();
+            data.shell_pids.insert(chat_id, shell_pid);
         }
+
+        let execution_result = {
+            let start = Instant::now();
+            let mut timed_out = false;
+
+            let mut output = loop {
+                match child.try_wait() {
+                    Ok(Some(_status)) => {
+                        break child.wait_with_output().map_err(|e| e.to_string())?
+                    }
+                    Ok(None) => {
+                        if start.elapsed() > SHELL_TIMEOUT {
+                            timed_out = true;
+                            let _ = child.kill();
+                            break child.wait_with_output().map_err(|e| e.to_string())?;
+                        }
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            };
+
+            if timed_out {
+                if !output.stderr.is_empty() {
+                    output.stderr.push(b'\n');
+                }
+                output
+                    .stderr
+                    .extend_from_slice(i18n::MSG_SHELL_TIMEOUT.as_bytes());
+            }
+            Ok(output)
+        };
+
+        {
+            let mut data = state_for_blocking.blocking_lock();
+            data.shell_pids.remove(&chat_id);
+        }
+
+        execution_result
     })
     .await;
 
@@ -273,7 +315,7 @@ pub(super) async fn handle_shell_command(
 
             parts.join("\n")
         }
-        Ok(Err(e)) => format!("Failed to execute: {}", html_escape(&e.to_string())),
+        Ok(Err(e)) => format!("Failed to execute: {}", html_escape(&e)),
         Err(e) => format!("Task error: {}", html_escape(&e.to_string())),
     };
 
@@ -287,4 +329,14 @@ pub(super) async fn handle_shell_command(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SHELL_TIMEOUT;
+
+    #[test]
+    fn test_shell_timeout_constant_exists() {
+        assert_eq!(SHELL_TIMEOUT.as_secs(), 60);
+    }
 }

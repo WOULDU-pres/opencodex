@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
 
@@ -141,6 +142,28 @@ fn write_bot_settings_file(path: &std::path::Path, token: &str, settings: &BotSe
 pub(super) fn save_bot_settings(token: &str, settings: &BotSettings) {
     if let Some(path) = bot_settings_path() {
         write_bot_settings_file(&path, token, settings);
+    }
+}
+
+pub fn cleanup_stale_sessions(max_age_days: u64) {
+    let Some(sessions_dir) = ai_sessions_dir() else {
+        return;
+    };
+    let cutoff = SystemTime::now() - Duration::from_secs(max_age_days.saturating_mul(86_400));
+
+    if let Ok(entries) = fs::read_dir(&sessions_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                if let Ok(meta) = path.metadata() {
+                    if let Ok(modified) = meta.modified() {
+                        if modified < cutoff {
+                            let _ = fs::remove_file(&path);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

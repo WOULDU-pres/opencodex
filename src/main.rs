@@ -1,6 +1,7 @@
 mod app;
 mod auth;
 mod codex;
+mod i18n;
 mod session;
 mod telegram;
 
@@ -174,8 +175,16 @@ async fn handle_sendfile(path: &str, chat_id: i64, hash_key: &str) -> Result<()>
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = dotenvy::dotenv();
     let cli = Cli::parse();
     codex::configure_execution(cli.omx, cli.madmax);
+
+    if cli.madmax {
+        eprintln!("⚠⚠⚠ WARNING: --madmax enabled ⚠⚠⚠");
+        eprintln!("  All Codex/OMX permission checks are DISABLED.");
+        eprintln!("  AI can execute commands without confirmation.");
+        eprintln!("  Use only in trusted environments.");
+    }
 
     if let Some(path) = cli.sendfile.as_deref() {
         let chat_id = cli
@@ -206,6 +215,18 @@ async fn main() -> Result<()> {
 
     let token = resolve_token(cli.token)?;
     validate_telegram_token(&token).await?;
+    telegram::cleanup_stale_sessions(30);
+
+    if codex::get_ai_binary_path().is_none() {
+        let (name, install) = if cli.omx {
+            ("omx", "npm install -g oh-my-codex")
+        } else {
+            ("codex", "npm install -g @openai/codex")
+        };
+        eprintln!("⚠ Warning: {} CLI not found in PATH.", name);
+        eprintln!("  AI features will not work until {} is installed.", name);
+        eprintln!("  Install: {}", install);
+    }
 
     println!("{} {}", env!("CARGO_BIN_NAME"), env!("CARGO_PKG_VERSION"));
     println!("project_dir: {}", canonical_project);

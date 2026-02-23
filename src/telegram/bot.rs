@@ -52,6 +52,8 @@ pub(super) struct SharedData {
     pub settings: BotSettings,
     /// Per-chat cancel tokens for stopping in-progress AI requests
     pub cancel_tokens: HashMap<ChatId, Arc<CancelToken>>,
+    /// Per-chat shell command PID for stopping in-progress `!` commands
+    pub shell_pids: HashMap<ChatId, u32>,
     /// Message ID of the "Stopping..." message sent by /stop, so the polling loop can update it
     pub stop_message_ids: HashMap<ChatId, teloxide::types::MessageId>,
     /// Per-chat timestamp of the last Telegram API call (for rate limiting)

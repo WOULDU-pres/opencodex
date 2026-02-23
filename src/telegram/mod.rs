@@ -7,4 +7,5 @@ mod streaming;
 mod tools;
 
 pub use commands::run_bot;
+pub use storage::cleanup_stale_sessions;
 pub use storage::resolve_token_by_hash;
